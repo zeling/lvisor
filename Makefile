@@ -181,7 +181,7 @@ QEMUOPTS += -machine q35,accel=kvm:tcg -cpu $(QEMU_CPU)
 QEMUOPTS += -m 1G
 QEMUOPTS += -device isa-debug-exit
 QEMUOPTS += -debugcon file:/dev/stdout
-QEMUOPTS += -serial mon:stdio -s -display none
+QEMUOPTS += -serial mon:stdio -display none
 
 qemu: $(VMM_BIN) $(KERNEL)
 ifneq ($(UNAME_S),Linux)
