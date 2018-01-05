@@ -108,7 +108,7 @@ static inline int pit_expect_msb(unsigned char val, uint64_t *tscp, unsigned lon
          * We require _some_ success, but the quality control
          * will be based on the error terms on the TSC values.
          */
-        return count > 5;
+        return count > 1;
 }
 
 /* The clock frequency of the i8253/i8254 PIT */
