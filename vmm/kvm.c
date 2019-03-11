@@ -22,26 +22,25 @@ static uint64_t ept_pd_0_4g[4 * 512] __aligned(PAGE_SIZE);
 
 DEFINE_PER_CPU(struct kvm_vcpu *, current_vcpu);
 
+#define GUEST_2M_PAGES (SZ_4G / SZ_2M)
+
+char guest_phys_mem[SZ_2M] __aligned(SZ_2M);
+
+#define guest_phys_base ALIGN(__pa(guest_phys_mem), SZ_2M)
+
+#define __gva(physaddr) __va(physaddr + guest_phys_base)
+
 static void construct_tdp(void)
 {
-        size_t i, n;
+        size_t i;
         uint64_t rwx = EPTE_READ | EPTE_WRITE | EPTE_EXECUTE;
 
-        BUG_ON(__pa(_start) % SZ_2M);
-        BUG_ON(__pa(_end) % SZ_2M);
-
         ept_pml4[0] = __pa(ept_pdpt_0_512g) | rwx;
-        for (i = 0; i < 4; ++i)
-                ept_pdpt_0_512g[i] = __pa(ept_pd_0_4g + i * 512) | rwx;
+        ept_pdpt_0_512g[0] = __pa(ept_pd_0_4g) | rwx;
 
-        /*
-         * Map the entire [0, 4G) except for [_start, _end)
-         * Is this safe?
-         */
-        for (i = 0, n = __pa(_start) / SZ_2M; i < n; ++i)
-                ept_pd_0_4g[i] = (SZ_2M * i) | rwx | EPTE_PSE;
-        for (i = __pa(_end) / SZ_2M, n = SZ_4G / SZ_2M; i < n; ++i)
-                ept_pd_0_4g[i] = (SZ_2M * i) | rwx | EPTE_PSE;
+        for (i = 0; i < GUEST_2M_PAGES; i++) {
+                ept_pd_0_4g[i] = guest_phys_base | rwx | EPTE_PSE;
+        }
 }
 
 void kvm_init(void)
@@ -61,7 +60,7 @@ void kvm_init(void)
         construct_tdp();
 
         /* copy firmware */
-        memcpy(__va(FIRMWARE_START), _binary_firmware_start, _binary_firmware_end - _binary_firmware_start);
+        memcpy(__gva(FIRMWARE_START), _binary_firmware_start, _binary_firmware_end - _binary_firmware_start);
 
         /* initialize e820 */
         BUG_ON(ARRAY_SIZE(guest_params.e820_table) < e820_table.nr_entries);
@@ -74,11 +73,11 @@ void kvm_init(void)
         guest_params.magic[2] = ((sizeof(guest_params) - 3) >> 8) & 0xff;
 
         /* check magic */
-        if (memcmp(guest_params.magic, __va(FIRMWARE_START), sizeof(guest_params.magic)))
+        if (memcmp(guest_params.magic, __gva(FIRMWARE_START), sizeof(guest_params.magic)))
                 panic("firmware magic doesn't match!\n");
 
         /* copy guest_params */
-        memcpy(__va(FIRMWARE_START), &guest_params, sizeof(struct guest_params));
+        memcpy(__gva(FIRMWARE_START), &guest_params, sizeof(struct guest_params));
 }
 
 static struct kvm_vcpu *create_vcpu(void)
