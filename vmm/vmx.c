@@ -277,6 +277,8 @@ static int setup_vmcs_config(struct vmcs_config *vmcs_conf)
 
         min = 0
                 | CPU_BASED_USE_MSR_BITMAPS
+                | CPU_BASED_RDTSC_EXITING
+                | CPU_BASED_CR3_LOAD_EXITING
                 | CPU_BASED_ACTIVATE_SECONDARY_CONTROLS
                 ;
         opt = 0;
@@ -301,7 +303,7 @@ static int setup_vmcs_config(struct vmcs_config *vmcs_conf)
                             &_cpu_based_2nd_exec_control);
 
         /* CR3 accesses and invlpg don't need to cause VM Exits when EPT enabled */
-        _cpu_based_exec_control &= ~(CPU_BASED_CR3_LOAD_EXITING |
+        _cpu_based_exec_control &= ~(/* CPU_BASED_CR3_LOAD_EXITING | */
                                      CPU_BASED_CR3_STORE_EXITING |
                                      CPU_BASED_INVLPG_EXITING);
         rdmsr(MSR_IA32_VMX_EPT_VPID_CAP,
@@ -1079,6 +1081,10 @@ static void handle_cr(struct kvm_vcpu *vcpu)
                 case 0:
                         vmx_set_cr0(vcpu, val);
                         return kvm_skip_emulated_instruction(vcpu);
+                case 3:
+                        pr_info("cr3: %lu\n", val);
+                        vmcs_writel(GUEST_CR3, val);
+                        return kvm_skip_emulated_instruction(vcpu);
                 case 4:
                         /*
                          * A "faithful" VMM should raise #GP if guest tries to set CR4.VMXE,
@@ -1142,11 +1148,41 @@ static void handle_wrmsr(struct kvm_vcpu *vcpu)
         return kvm_skip_emulated_instruction(vcpu);
 }
 
+static void handle_rdtsc(struct kvm_vcpu *vcpu)
+{
+        uint64_t val = rdtsc();
+	    kvm_write_edx_eax(vcpu, val);
+
+	    return kvm_skip_emulated_instruction(vcpu);
+}
+
+static void handle_vmcall(struct kvm_vcpu *vcpu)
+{
+        unsigned long sysno = kvm_register_read(vcpu, VCPU_REGS_RAX);
+        unsigned long arg = kvm_register_read(vcpu, VCPU_REGS_RDI);
+        switch (sysno) {
+            case 0:
+                    /* hi */
+                    pr_info("hey %ld\n", arg);
+                    kvm_register_write(vcpu, VCPU_REGS_RAX, 0);
+                    kvm_skip_emulated_instruction(vcpu);
+                    break;
+            case 1:
+                    /* bye */
+                    pr_info("bye %ld\n", arg);
+                    die();
+            default:
+                    pr_info("unhandled vmcall %ld\n", sysno);
+        }
+}
+
 static void (*const vmx_exit_handlers[])(struct kvm_vcpu *) = {
         [EXIT_REASON_CR_ACCESS]         = handle_cr,
         [EXIT_REASON_CPUID]             = kvm_emulate_cpuid,
         [EXIT_REASON_MSR_READ]          = handle_rdmsr,
         [EXIT_REASON_MSR_WRITE]         = handle_wrmsr,
+        [EXIT_REASON_RDTSC]             = handle_rdtsc,
+        [EXIT_REASON_VMCALL]            = handle_vmcall,
 };
 
 static void vmx_handle_exit(struct kvm_vcpu *vcpu)
