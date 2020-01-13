@@ -57,12 +57,28 @@ static const struct kvm_vmx_segment_field {
         VMX_SEGMENT_FIELD(LDTR),
 };
 
+#define MSR_SAVE_LIST(T) \
+	T(MSR_KERNEL_GS_BASE) \
+	T(MSR_SYSCALL_MASK) \
+	T(MSR_LSTAR) \
+	T(MSR_STAR)
+
+enum saved_msrs {
+#define T(msr) SAVED_##msr,
+	MSR_SAVE_LIST(T)
+#undef T
+};
+
 static const uint32_t vmx_msr_index[] = {
-        MSR_KERNEL_GS_BASE,
-        /*
-         * VMM doesn't use syscalls so there is no need to save
-         * MSR_SYSCALL_MASK, MSR_LSTAR, MSR_CSTAR, MSR_STAR.
-         */
+#define T(msr) msr,
+	MSR_SAVE_LIST(T)
+#undef T
+};
+
+static const char *vmx_msr_name[] = {
+#define T(msr) #msr,
+	MSR_SAVE_LIST(T)
+#undef T
 };
 
 struct vcpu_vmx {
@@ -278,6 +294,8 @@ static int setup_vmcs_config(struct vmcs_config *vmcs_conf)
         min = 0
                 | CPU_BASED_USE_MSR_BITMAPS
                 | CPU_BASED_ACTIVATE_SECONDARY_CONTROLS
+		| CPU_BASED_RDTSC_EXITING
+                | CPU_BASED_CR3_LOAD_EXITING
                 ;
         opt = 0;
         adjust_vmx_controls(min, opt, MSR_IA32_VMX_PROCBASED_CTLS,
@@ -301,7 +319,7 @@ static int setup_vmcs_config(struct vmcs_config *vmcs_conf)
                             &_cpu_based_2nd_exec_control);
 
         /* CR3 accesses and invlpg don't need to cause VM Exits when EPT enabled */
-        _cpu_based_exec_control &= ~(CPU_BASED_CR3_LOAD_EXITING |
+        _cpu_based_exec_control &= ~(// CPU_BASED_CR3_LOAD_EXITING |
                                      CPU_BASED_CR3_STORE_EXITING |
                                      CPU_BASED_INVLPG_EXITING);
         rdmsr(MSR_IA32_VMX_EPT_VPID_CAP,
@@ -444,6 +462,9 @@ static int vmx_hardware_setup(void)
         for (i = MSR_IA32_VMX_BASIC; i <= MSR_IA32_VMX_VMFUNC; ++i)
                 set_msr_interception(i, 1, 1);
 
+	/* intercept write into efer to disable SCE */
+	set_msr_interception(MSR_EFER, 0, 1);
+
         return 0;
 }
 
@@ -545,6 +566,11 @@ static void vmx_set_cr0(struct kvm_vcpu *vcpu, unsigned long cr0)
         vmcs_writel(GUEST_CR0, cr0 | KVM_GUEST_CR0_ALWAYS_ON);
 }
 
+static void vmx_set_cr3(struct kvm_vcpu *vcpu, unsigned long cr3)
+{
+        vmcs_writel(GUEST_CR3, cr3);
+}
+
 static void vmx_set_cr4(struct kvm_vcpu *vcpu, unsigned long cr4)
 {
         vmcs_writel(GUEST_CR4, cr4 | KVM_GUEST_CR4_ALWAYS_ON);
@@ -586,6 +612,7 @@ static void vmx_vcpu_setup(struct kvm_vcpu *vcpu)
         vmcs_write32(VM_EXIT_CONTROLS, vmcs_config.vmexit_ctrl);
         vmcs_write32(VM_ENTRY_CONTROLS, vmcs_config.vmentry_ctrl);
 
+	vmcs_write32(EXCEPTION_BITMAP, (1 << 6) | (1 << 14));
         vmcs_write32(PAGE_FAULT_ERROR_CODE_MASK, 0);
         vmcs_write32(PAGE_FAULT_ERROR_CODE_MATCH, 0);
         vmcs_write32(CR3_TARGET_COUNT, 0);
@@ -986,6 +1013,11 @@ static void dump_vmcs(struct kvm_vcpu *vcpu)
                 pr_err("InterruptStatus = %04x\n",
                        vmcs_read16(GUEST_INTR_STATUS));
 
+	/* DUMP all saved MSRs */
+	for (i = 0; i < ARRAY_SIZE(vmx_msr_index); i++) {
+		pr_err("%s = 0x%016" PRIx64 "\n", vmx_msr_name[i], to_vmx(vcpu)->msr_autoload.guest[i].value);
+	}
+
         pr_err("*** Host State ***\n");
         pr_err("RIP = 0x%016lx  RSP = 0x%016lx\n",
                vmcs_readl(HOST_RIP), vmcs_readl(HOST_RSP));
@@ -1061,6 +1093,13 @@ static void dump_vmcs(struct kvm_vcpu *vcpu)
                        vmcs_read16(VIRTUAL_PROCESSOR_ID));
 }
 
+static void handle_rdtsc(struct kvm_vcpu *vcpu)
+{
+	uint64_t val = 100 * rdtsc();
+	kvm_write_edx_eax(vcpu, val);
+	return kvm_skip_emulated_instruction(vcpu);
+}
+
 static void handle_cr(struct kvm_vcpu *vcpu)
 {
         unsigned long exit_qualification, val;
@@ -1079,6 +1118,10 @@ static void handle_cr(struct kvm_vcpu *vcpu)
                 case 0:
                         vmx_set_cr0(vcpu, val);
                         return kvm_skip_emulated_instruction(vcpu);
+		case 3:
+			pr_info("cr3: %lx\n", val);
+			vmx_set_cr3(vcpu, val);
+			return kvm_skip_emulated_instruction(vcpu);
                 case 4:
                         /*
                          * A "faithful" VMM should raise #GP if guest tries to set CR4.VMXE,
@@ -1134,6 +1177,12 @@ static void handle_wrmsr(struct kvm_vcpu *vcpu)
                         break;
                 }
                 break;
+	case MSR_EFER:
+		/* disable SCE */
+		pr_info("the guest wants to set EFER to: 0x%016" PRIx64 "\n", val);
+		vmcs_write64(GUEST_IA32_EFER, val & ~EFER_SCE);
+		// vmcs_write64(GUEST_IA32_EFER, val);
+		break;
         default:
                 dump_vmcs(vcpu);
                 panic("unknown wrmsr 0x%08x\n", msr);
@@ -1142,11 +1191,171 @@ static void handle_wrmsr(struct kvm_vcpu *vcpu)
         return kvm_skip_emulated_instruction(vcpu);
 }
 
+static uint64_t masks[] = {
+	0xffffff8000000000,
+	0xffffffffc0000000,
+	0xffffffffffe00000,
+	0xfffffffffffff000,
+};
+static uint64_t shifts[] = {
+	39,
+	30,
+	21,
+	12,
+};
+
+static uint64_t gpa2hpa(uint64_t eptp, uint64_t gpa) {
+	uint64_t entry, *entries = (uint64_t *) __va(eptp);
+	
+	for (int i = 0; i < 4; i++) {
+		uint64_t idx = (gpa >> shifts[i]) & 0x1ff;
+		entry = entries[idx];
+		assert(entry & 0x1); /* must be readable */
+		if (entry & (1 << 7)) {
+			/* large page */
+			assert(i == 1 || i == 2);
+			return (entry & masks[i]) | (gpa & ~masks[i]);
+		} else {
+			/* keep walking */
+			entries = (uint64_t *) __va(entry & ~0xfff);
+		}
+	}
+	return (entry & ~0xfff) | (gpa & 0xfff);
+}
+
+static void *gva2hva(uintptr_t gva) {
+	uintptr_t cr3;
+	uint64_t eptr, entry;
+	cr3 = vmcs_readl(GUEST_CR3);
+	eptr = vmcs_read64(EPT_POINTER);
+
+	uint64_t *entries = (uint64_t *) __va(gpa2hpa(eptr & ~0xfff, cr3 & ~0xfff));
+	for (int i = 0; i < 4; i++) {
+		uint64_t idx = (gva >> shifts[i]) & 0x1ff;
+		entry = entries[idx];
+		assert(entry & 0x1);
+		if (entry & (1 << 7)) {
+			assert(i == 1 || i == 2);
+			return (void *) ((entry & masks[i]) | (gva & ~masks[i]));
+		} else if (i < 3) {
+			entries = (uint64_t *) __va(gpa2hpa(eptr & ~0xfff, entry & ~0xfff));
+		}
+	}
+
+	return (void *) __va((entry & ~0xfff) | (gva & 0xfff));
+}
+
+static void handle_syscall(struct kvm_vcpu *vcpu)
+{
+#define SAVED_MSR(msr) to_vmx(vcpu)->msr_autoload.guest[SAVED_##msr].value
+	pr_info("syscall!\n");
+	struct kvm_segment cs, ss;
+	unsigned long syscall_mask;
+	uint64_t rip = SAVED_MSR(MSR_LSTAR);
+	kvm_skip_emulated_instruction(vcpu);
+	vcpu->regs[VCPU_REGS_RCX] = vmx_get_rip(vcpu);
+	vmx_set_rip(vcpu, rip);
+	unsigned long rflags = vmx_get_rflags(vcpu);
+	vcpu->regs[VCPU_REGS_R11] = rflags;
+	syscall_mask = SAVED_MSR(MSR_SYSCALL_MASK);
+	vmx_set_rflags(vcpu, rflags & ~syscall_mask);
+	/* CS */
+	cs.selector = (SAVED_MSR(MSR_STAR) >> 32 & 0xfffc);
+	cs.base = 0;
+	cs.limit = 0xfffff;
+	cs.type = 11;
+	cs.s = 1;
+	cs.dpl = 0;
+	cs.present = 1;
+	cs.l = 1;
+	cs.db = 0;
+	cs.g = 1;
+	cs.unusable = 0;
+	/* SS */
+	ss.selector = (SAVED_MSR(MSR_STAR) >> 32 & 0xffff) + 8;
+	ss.base = 0;
+	ss.limit = 0xfffff;
+	ss.type = 3;
+	ss.s = 1;
+	ss.dpl = 0;
+	ss.present = 1;
+	ss.db = 1;
+	ss.g = 1;
+	ss.l = 0;
+	ss.unusable = 0;
+	
+	vmx_set_segment(vcpu, &cs, VCPU_SREG_CS);
+	vmx_set_segment(vcpu, &ss, VCPU_SREG_SS);
+}
+
+static void handle_sysret(struct kvm_vcpu *vcpu)
+{
+	pr_info("sysret!\n");
+	struct kvm_segment cs, ss;
+	vmx_set_rip(vcpu, vcpu->regs[VCPU_REGS_RCX]);
+	vmx_set_rflags(vcpu, (vcpu->regs[VCPU_REGS_R11] & 0x3c7fd7) | 2);
+
+	cs.selector = ((SAVED_MSR(MSR_STAR) >> 48) & 0xffff) + 16;
+	cs.selector |= 3;
+	cs.base = 0;
+	cs.limit = 0xfffff;
+	cs.type = 11;
+	cs.s = 1;
+	cs.dpl = 3;
+	cs.present = 1;
+	cs.l = 1;
+	cs.db = 0;
+	cs.g = 1;
+	cs.unusable = 0;
+
+	ss.selector = ((SAVED_MSR(MSR_STAR) >> 48) & 0xffff) + 8;
+	ss.selector |= 3;
+	ss.base = 0;
+	ss.limit = 0xfffff;
+	ss.type = 3;
+	ss.s = 1;
+	ss.dpl = 3;
+	ss.present = 1;
+	ss.db = 1;
+	ss.g = 1;
+	ss.l = 0;
+	ss.unusable = 0;
+
+	vmx_set_segment(vcpu, &cs, VCPU_SREG_CS);
+	vmx_set_segment(vcpu, &ss, VCPU_SREG_SS);
+#undef SAVED_MSR
+}
+
+static void handle_exception_nmi(struct kvm_vcpu *vcpu)
+{
+        uint32_t intr_info, exception, type;
+	unsigned long rip;
+	intr_info = vmcs_read32(VM_EXIT_INTR_INFO);
+	type = (intr_info >> 8) & 0x7;
+	exception = intr_info & 0xff;
+	// pr_info("intr_info: %x, type: %x, exception: %x, qual: %lx\n", intr_info, type, exception, qual);
+	if (exception == 6 && type == 3) {
+		/* #UD */
+		rip = vmx_get_rip(vcpu);
+		char *instr = (char *) gva2hva(rip);
+		if (instr[0] == 0xf && instr[1] == 0x5) {
+			return handle_syscall(vcpu);
+		} else if (instr[0] == 0x48 && instr[1] == 0xf && instr[2] == 0x7) {
+			return handle_sysret(vcpu);
+		}
+
+	}
+	dump_vmcs(vcpu);
+	panic("cannot handle exception/nmi\n");
+}
+
 static void (*const vmx_exit_handlers[])(struct kvm_vcpu *) = {
+	[EXIT_REASON_EXCEPTION_NMI]     = handle_exception_nmi,
         [EXIT_REASON_CR_ACCESS]         = handle_cr,
         [EXIT_REASON_CPUID]             = kvm_emulate_cpuid,
         [EXIT_REASON_MSR_READ]          = handle_rdmsr,
         [EXIT_REASON_MSR_WRITE]         = handle_wrmsr,
+	[EXIT_REASON_RDTSC]             = handle_rdtsc,
 };
 
 static void vmx_handle_exit(struct kvm_vcpu *vcpu)

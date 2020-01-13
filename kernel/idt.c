@@ -166,7 +166,7 @@ void update_intr_gate(unsigned int n, const void *addr)
 
 __weak void do_trap(struct pt_regs *regs, long error_code, char *str, unsigned long trapnr)
 {
-        pr_err("unknown vector: %ld (%s)\n", trapnr, str);
+        pr_err("unknown vector: %ld (%s), error code: %lx\n", trapnr, str, error_code);
         show_regs(regs);
         die();
 }

@@ -24,6 +24,7 @@ DEFINE_PER_CPU(struct kvm_vcpu *, current_vcpu);
 
 static void construct_tdp(void)
 {
+	pr_info("ept_pml4: %" PRIx64 "\n", __pa(ept_pml4));
         size_t i, n;
         uint64_t rwx = EPTE_READ | EPTE_WRITE | EPTE_EXECUTE;
 
