@@ -8,6 +8,7 @@
 #include <asm/vmx.h>
 
 #define NR_AUTOLOAD_MSRS        8
+#define SYSCALL_INVALID_ADDR     42
 
 extern const uint64_t vmx_return;
 
@@ -63,11 +64,14 @@ static const uint32_t vmx_msr_index[] = {
          * VMM doesn't use syscalls so there is no need to save
          * MSR_SYSCALL_MASK, MSR_LSTAR, MSR_CSTAR, MSR_STAR.
          */
+	MSR_LSTAR,
+	MSR_SYSCALL_MASK,
 };
 
 struct vcpu_vmx {
         struct kvm_vcpu vcpu;
         uint64_t host_rsp;
+	uint64_t guest_syscall_entry;
         int fail;
         int launched;
         struct msr_autoload {
@@ -278,6 +282,8 @@ static int setup_vmcs_config(struct vmcs_config *vmcs_conf)
         min = 0
                 | CPU_BASED_USE_MSR_BITMAPS
                 | CPU_BASED_ACTIVATE_SECONDARY_CONTROLS
+		| CPU_BASED_RDTSC_EXITING
+                | CPU_BASED_CR3_LOAD_EXITING
                 ;
         opt = 0;
         adjust_vmx_controls(min, opt, MSR_IA32_VMX_PROCBASED_CTLS,
@@ -301,7 +307,7 @@ static int setup_vmcs_config(struct vmcs_config *vmcs_conf)
                             &_cpu_based_2nd_exec_control);
 
         /* CR3 accesses and invlpg don't need to cause VM Exits when EPT enabled */
-        _cpu_based_exec_control &= ~(CPU_BASED_CR3_LOAD_EXITING |
+        _cpu_based_exec_control &= ~(// CPU_BASED_CR3_LOAD_EXITING |
                                      CPU_BASED_CR3_STORE_EXITING |
                                      CPU_BASED_INVLPG_EXITING);
         rdmsr(MSR_IA32_VMX_EPT_VPID_CAP,
@@ -444,6 +450,9 @@ static int vmx_hardware_setup(void)
         for (i = MSR_IA32_VMX_BASIC; i <= MSR_IA32_VMX_VMFUNC; ++i)
                 set_msr_interception(i, 1, 1);
 
+	/* trap syscall */
+	set_msr_interception(MSR_LSTAR, 0, 1);
+
         return 0;
 }
 
@@ -545,6 +554,11 @@ static void vmx_set_cr0(struct kvm_vcpu *vcpu, unsigned long cr0)
         vmcs_writel(GUEST_CR0, cr0 | KVM_GUEST_CR0_ALWAYS_ON);
 }
 
+static void vmx_set_cr3(struct kvm_vcpu *vcpu, unsigned long cr3)
+{
+        vmcs_writel(GUEST_CR3, cr3);
+}
+
 static void vmx_set_cr4(struct kvm_vcpu *vcpu, unsigned long cr4)
 {
         vmcs_writel(GUEST_CR4, cr4 | KVM_GUEST_CR4_ALWAYS_ON);
@@ -586,6 +600,7 @@ static void vmx_vcpu_setup(struct kvm_vcpu *vcpu)
         vmcs_write32(VM_EXIT_CONTROLS, vmcs_config.vmexit_ctrl);
         vmcs_write32(VM_ENTRY_CONTROLS, vmcs_config.vmentry_ctrl);
 
+	vmcs_write32(EXCEPTION_BITMAP, (1 << 14));
         vmcs_write32(PAGE_FAULT_ERROR_CODE_MASK, 0);
         vmcs_write32(PAGE_FAULT_ERROR_CODE_MATCH, 0);
         vmcs_write32(CR3_TARGET_COUNT, 0);
@@ -1061,6 +1076,13 @@ static void dump_vmcs(struct kvm_vcpu *vcpu)
                        vmcs_read16(VIRTUAL_PROCESSOR_ID));
 }
 
+static void handle_rdtsc(struct kvm_vcpu *vcpu)
+{
+	uint64_t val = 100 * rdtsc();
+	kvm_write_edx_eax(vcpu, val);
+	return kvm_skip_emulated_instruction(vcpu);
+}
+
 static void handle_cr(struct kvm_vcpu *vcpu)
 {
         unsigned long exit_qualification, val;
@@ -1079,6 +1101,10 @@ static void handle_cr(struct kvm_vcpu *vcpu)
                 case 0:
                         vmx_set_cr0(vcpu, val);
                         return kvm_skip_emulated_instruction(vcpu);
+		case 3:
+			pr_info("cr3: %lx\n", val);
+			vmx_set_cr3(vcpu, val);
+			return kvm_skip_emulated_instruction(vcpu);
                 case 4:
                         /*
                          * A "faithful" VMM should raise #GP if guest tries to set CR4.VMXE,
@@ -1134,6 +1160,11 @@ static void handle_wrmsr(struct kvm_vcpu *vcpu)
                         break;
                 }
                 break;
+	case MSR_LSTAR:
+		pr_info("intercepting wrmsr to IA32_LSTAR\n");
+		to_vmx(vcpu)->msr_autoload.guest[1].value = SYSCALL_INVALID_ADDR;
+		to_vmx(vcpu)->guest_syscall_entry = val;
+		break;
         default:
                 dump_vmcs(vcpu);
                 panic("unknown wrmsr 0x%08x\n", msr);
@@ -1142,11 +1173,80 @@ static void handle_wrmsr(struct kvm_vcpu *vcpu)
         return kvm_skip_emulated_instruction(vcpu);
 }
 
+static void handle_syscall(struct kvm_vcpu *vcpu)
+{
+	pr_info("syscall!\n");
+	struct kvm_segment cs, ss;
+	unsigned long syscall_mask;
+	uint64_t rip = to_vmx(vcpu)->guest_syscall_entry;
+	pr_info("rip: %lx, target_rip: %lx\n", kvm_rip_read(vcpu), rip);
+	pr_info("rcp: %lx\n", vcpu->regs[VCPU_REGS_RCX]);
+//	vcpu->regs[VCPU_REGS_RCX] = vmx_get_rip(vcpu);
+	vmx_set_rip(vcpu, rip);
+	unsigned long rflags = vmx_get_rflags(vcpu);
+	vcpu->regs[VCPU_REGS_R11] = rflags;
+	syscall_mask = to_vmx(vcpu)->msr_autoload.guest[2].value;
+	vmx_set_rflags(vcpu, rflags & ~syscall_mask);
+	/* CS */
+	cs.selector = (rip >> 32 & 0xfffc);
+	cs.base = 0;
+	cs.limit = 0xfffff;
+	cs.type = 3;
+	cs.s = 1;
+	cs.dpl = 0;
+	cs.present = 1;
+	cs.l = 1;
+	cs.db = 1;
+	cs.g = 1;
+	
+	ss.selector = (rip >> 32 & 0xffff) + 8;
+	ss.limit = 0xfffff;
+	ss.type = 3;
+	ss.s = 1;
+	ss.dpl = 0;
+	ss.present = 1;
+	ss.db = 1;
+	ss.g = 1;
+	
+	vmx_set_segment(vcpu, &cs, VCPU_SREG_CS);
+	vmx_set_segment(vcpu, &ss, VCPU_SREG_SS);
+
+	return kvm_skip_emulated_instruction(vcpu);
+}
+
+static void handle_pagefault(struct kvm_vcpu *vcpu)
+{
+        unsigned long fault_address;
+	fault_address = vmcs_readl(EXIT_QUALIFICATION);
+	pr_info("fault addr: %lx\n", fault_address);
+	if (fault_address == SYSCALL_INVALID_ADDR) {
+		/* caused by syscall */
+		return handle_syscall(vcpu);
+	}
+	panic("cannot handle pgfault\n");
+}
+
+static void handle_exception_nmi(struct kvm_vcpu *vcpu)
+{
+        uint32_t intr_info, exception, type;
+	intr_info = vmcs_read32(VM_EXIT_INTR_INFO);
+	type = (intr_info >> 8) & 0x7;
+	exception = intr_info & 0xff;
+	// pr_info("intr_info: %x, type: %x, exception: %x\n", intr_info, type, exception);
+	if (exception == 14 && type == 3) {
+		/* pgfault */
+		return handle_pagefault(vcpu);
+	}
+	panic("cannot handle exception/nmi\n");
+}
+
 static void (*const vmx_exit_handlers[])(struct kvm_vcpu *) = {
+	[EXIT_REASON_EXCEPTION_NMI]     = handle_exception_nmi,
         [EXIT_REASON_CR_ACCESS]         = handle_cr,
         [EXIT_REASON_CPUID]             = kvm_emulate_cpuid,
         [EXIT_REASON_MSR_READ]          = handle_rdmsr,
         [EXIT_REASON_MSR_WRITE]         = handle_wrmsr,
+	[EXIT_REASON_RDTSC]             = handle_rdtsc,
 };
 
 static void vmx_handle_exit(struct kvm_vcpu *vcpu)
