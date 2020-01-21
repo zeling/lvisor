@@ -1095,7 +1095,7 @@ static void dump_vmcs(struct kvm_vcpu *vcpu)
 
 static void handle_rdtsc(struct kvm_vcpu *vcpu)
 {
-	uint64_t val = 100 * rdtsc();
+	uint64_t val = rdtsc();
 	kvm_write_edx_eax(vcpu, val);
 	return kvm_skip_emulated_instruction(vcpu);
 }
