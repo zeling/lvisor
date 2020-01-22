@@ -1191,6 +1191,15 @@ static void handle_wrmsr(struct kvm_vcpu *vcpu)
         return kvm_skip_emulated_instruction(vcpu);
 }
 
+static void handle_ept_violation(struct kvm_vcpu *vcpu)
+{
+	uint64_t guest_phys;
+	if (!vcpu->ept_handler)
+		panic("cannot handle EPT violation\n");
+	guest_phys = vmcs_read64(GUEST_PHYSICAL_ADDRESS);
+	vcpu->ept_handler(guest_phys);
+}
+
 static uint64_t masks[] = {
 	0xffffff8000000000,
 	0xffffffffc0000000,
@@ -1356,6 +1365,7 @@ static void (*const vmx_exit_handlers[])(struct kvm_vcpu *) = {
         [EXIT_REASON_MSR_READ]          = handle_rdmsr,
         [EXIT_REASON_MSR_WRITE]         = handle_wrmsr,
 	[EXIT_REASON_RDTSC]             = handle_rdtsc,
+	[EXIT_REASON_EPT_VIOLATION]     = handle_ept_violation,
 };
 
 static void vmx_handle_exit(struct kvm_vcpu *vcpu)

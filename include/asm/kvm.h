@@ -11,3 +11,5 @@ struct kvm_segment {
         uint8_t  unusable;
         uint8_t  padding;
 };
+
+typedef void (*ept_violation_handler)(uint64_t guest_phys);

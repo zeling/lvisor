@@ -45,6 +45,7 @@ struct kvm_vcpu {
         uint64_t cr2;
         _Atomic int activity_state;
         uint8_t sipi_vector;
+	ept_violation_handler ept_handler;
 };
 
 struct kvm_x86_ops {
@@ -94,6 +95,12 @@ static inline void kvm_write_edx_eax(struct kvm_vcpu *vcpu, uint64_t val)
         kvm_register_write(vcpu, VCPU_REGS_RAX, (uint32_t)val);
         kvm_register_write(vcpu, VCPU_REGS_RDX, (uint32_t)(val >> 32));
 }
+
+static inline void kvm_set_ept_violation_handler(struct kvm_vcpu *vcpu, ept_violation_handler handler)
+{
+	vcpu->ept_handler = handler;
+}
+
 
 unsigned long kvm_rip_read(struct kvm_vcpu *vcpu);
 void kvm_rip_write(struct kvm_vcpu *vcpu, unsigned long val);

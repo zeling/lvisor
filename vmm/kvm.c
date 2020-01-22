@@ -6,6 +6,9 @@
 #include <asm/setup.h>
 #include <sys/errno.h>
 #include <sys/string.h>
+#include <asm/e820.h>
+#include <asm/setup.h>
+
 
 #define EPTE_READ               BIT_64(0)
 #define EPTE_WRITE              BIT_64(1)
@@ -22,9 +25,8 @@ static uint64_t ept_pd_0_4g[4 * 512] __aligned(PAGE_SIZE);
 
 DEFINE_PER_CPU(struct kvm_vcpu *, current_vcpu);
 
-static void construct_tdp(void)
+__attribute__((unused)) static void construct_tdp(void)
 {
-	pr_info("ept_pml4: %" PRIx64 "\n", __pa(ept_pml4));
         size_t i, n;
         uint64_t rwx = EPTE_READ | EPTE_WRITE | EPTE_EXECUTE;
 
@@ -59,7 +61,6 @@ void kvm_init(void)
                 panic("kvm: disabled by bios\n");
 
         kvm_x86_ops->hardware_setup();
-        construct_tdp();
 
         /* copy firmware */
         memcpy(__va(FIRMWARE_START), _binary_firmware_start, _binary_firmware_end - _binary_firmware_start);
@@ -82,6 +83,25 @@ void kvm_init(void)
         memcpy(__va(FIRMWARE_START), &guest_params, sizeof(struct guest_params));
 }
 
+static void handle_ept_violation(uint64_t guest_phys)
+{
+	static int pml4_0_512g_initialized = 0;
+        uint64_t rwx = EPTE_READ | EPTE_WRITE | EPTE_EXECUTE;
+	if ((uint64_t) _start <= guest_phys && guest_phys < (uint64_t) _end) {
+		panic("cannot write into VMM\n");
+	}
+	if (guest_phys >= SZ_4G) {
+		panic("cannot write to physmem higher than 4G\n");
+	}
+	if (!pml4_0_512g_initialized) {
+		ept_pml4[0] = __pa(ept_pdpt_0_512g) | rwx;
+		for (int i = 0; i < 4; ++i)
+			ept_pdpt_0_512g[i] = __pa(ept_pd_0_4g + i * 512) | rwx;
+		pml4_0_512g_initialized = 1;
+	}
+	ept_pd_0_4g[guest_phys / SZ_2M] = (guest_phys & ~(SZ_2M - 1)) | rwx | EPTE_PSE;
+}
+
 static struct kvm_vcpu *create_vcpu(void)
 {
         struct kvm_vcpu *vcpu;
@@ -91,6 +111,7 @@ static struct kvm_vcpu *create_vcpu(void)
 
         /* set EPT */
         kvm_x86_ops->set_tdp(vcpu, __pa(ept_pml4));
+	kvm_set_ept_violation_handler(vcpu, handle_ept_violation);
 
         this_cpu_write(current_vcpu, vcpu);
         return vcpu;
